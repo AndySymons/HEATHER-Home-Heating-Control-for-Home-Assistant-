@@ -7,4 +7,4 @@ To get started download the ZIP file to a temporary location on a local disk dri
 
 In the resulting folder there are detailed instructions, an EXCEL data file and a WORD mail merge file for each YAML file. 
 
-Please see the *Instructions* inside the package for full details of how to use the code generator. 
+Please see the *Guide* inside the package for tips on setting up a full home smart heating system, and details of how to use the code generator. 
