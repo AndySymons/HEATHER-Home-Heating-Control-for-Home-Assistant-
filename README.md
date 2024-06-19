@@ -1,4 +1,5 @@
-# Heating-XYZ-code-generator
+# Project HEATHER -- Heating XYZ Code Generator
+
 Installation aid for the Home Assistant Blueprints **Heating X2**, **Calendar Switch Y2**, and **Zone Switch Z2**, 
 
 Uses Microsoft Mail Merge to create YAML files for all the template sensors and helpers required for a complete home heating system. Microsoft Office (WORD and EXCEL) is a prerequisite (sorry I could not find a free package to do this).
