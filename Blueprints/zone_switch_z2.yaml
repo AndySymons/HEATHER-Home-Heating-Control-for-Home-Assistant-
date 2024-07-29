@@ -1,0 +1,592 @@
+### ------------------------------------------------------------------------------------
+###
+###      Zone Switch Z2
+###      --------------
+###
+### Turns on a zone control valve if any one heat demand input is 'on' (true)
+### Turns it off if all heat demand inputs are 'off' (false)
+###
+### RELEASE 2.0
+###   10-Feb-24 | Andy Symons
+###     First published version, but called 'X2' because it is aligned with Heating X2
+###     and the release 2.1 Code Generator)
+###
+### RELEASE 2.1 
+###   14-Mar-24 | Andy Symons 
+###     Rewritten to be more like Heatıng X2 and Calendar Y1. Renamed from X2 to Z2.   
+###     Same functions but now with device checking, notifications and logging.
+###
+### Minor updates
+###   14-Mar-2024: 2.1.01 Added extra unknown and unavailable test to the echoblock timer end tests  
+###   16-Mar-2024: 2.2.02  Changed logging to use the new script.heating_xyz_logfile_entry (making the code more compact and maintainable) 
+###   18-Jun-2024: 2.2.03  Changed the name of script 'heating_xyz_logfile_entry' to just 'logfile_entry' 
+###
+### OVERVIEW
+### The main action steps are as follows.
+### The numbering correspnds to that used by the system log for error messages.
+### ACTION[0] -- LOG THE TRIGGER. Starts a new log file entry by writing a bank line and the trigger id
+### ACTIONS[1-3] -- FETCH THE CURRENT AND NEXT CALENDAR EVENTS
+###              Calls calendar.get_events twice, then sets local variables for later use
+### ACTION[4] -- RESPOND TO TRIGGERS WHERE NECESSARY. A big choose statement on the trigger_id.
+### ACTION[5] -- DETERMINE THE REQUIRED state ACCORDING TO THE STATE. A big chooose statement on the relevant states variables.
+###              Decides what state is required and why. Sets the 'required state' helper and the 'reason test' helper.
+### ACTION[6] -- SEND state CHANGE TO THE deviceS
+###              Loops through all the devices for the room. If the required state is
+###              different from the actual one, the service call to change it is invoked and the echoblock (response timerout) timer started.
+### ACTION[7] -- LOG THE REASON. Writes the last line of the log file entry
+###
+### ------------------------------------------------------------------------------------------------
+
+blueprint:
+  name: "Zone Switch Z2"
+  description: Controls one or more switched devices (zone valves) from a binary sensor (heat demand group)
+  domain: automation
+
+  ### ----------------------------------------------------------------------------------------------
+  ### INPUTS
+  ### ----------------------------------------------------------------------------------------------
+
+  input:
+    switched_device:
+      name: DEVICE ENTITIES - The devices to be switched
+      description: One or more switch entities that are to be controlled by this automation
+      selector:
+        entity:
+          filter:
+            domain:
+              - switch
+          multiple: false
+
+    away_mode:
+      name: DEVİCE ENTITY - Away switch, binary sensor or input boolean (if required)
+      description: A switch, input boolean, or binary sensor that switches all devices. NOT RECOMMENDED for zone switches
+      selector:
+        entity:
+      default: []
+
+    demand_sensor:
+      name: SENSOR ENTITY - sensor that determines heat demand (mandatory)
+      description: The calendar dedicated to scheduling events for this/these device(s)
+      selector:
+        entity:
+          filter:
+            domain:
+              - binary_sensor
+              - switch
+              - input_boolean
+          multiple: false
+
+    setting_reason:
+      name: HELPER - Setting reason (mandatory)
+      description: The global variable (helper) into which the automation writes the reason for the current setting (for use on a dashboard)
+      selector:
+        entity:
+          filter:
+            domain: input_text
+
+    required_state:
+      name: HELPER - Required state (mandatory)
+      description: The global boolean variable (helper) to hold the state required
+      selector:
+        entity:
+          filter:
+            domain: input_boolean
+
+    echoblock_timer:
+      name: HELPER - Echoblock timer (mandatory)
+      description: The timer for use inside the automation to disinguish genuine manual changes of the set state from those set by the automation
+      selector:
+        entity:
+          filter:
+            domain: timer
+
+    logging_service_name:
+      name: LOGGING - Specify the service for logging
+      description: Enter service name (not filename) as a string
+      default: ""
+
+mode: queued # use all triggers but avoid conflicting states
+
+## -------------------------------------------------------------------------------------------------
+## LOCAL VARİABLES
+## Constants, and input variable values for use in templates
+## -------------------------------------------------------------------------------------------------
+
+variables:
+  # Parameters -- hold the actual value
+  local_logging_service_name: !input logging_service_name
+
+  # Devices and helpers -- hold the entity
+  local_away_mode: !input away_mode
+  local_demand_sensor: !input demand_sensor
+  local_echoblock_timer: !input echoblock_timer
+  local_required_state: !input required_state
+  local_setting_reason: !input setting_reason
+  local_switched_device: !input switched_device
+
+  # Handy constants
+  # identifies the source of the log messages
+  log_message_preamble: >
+    {{ this.attributes.friendly_name }}
+
+## -------------------------------------------------------------------------------------------------
+## TRIGGERS
+## -------------------------------------------------------------------------------------------------
+
+trigger:
+  # System restart
+  - platform: homeassistant
+    event: start
+    id: startup
+
+  # Demand sensor state change
+  - platform: state
+    entity_id: !input demand_sensor
+    id: demand_sensor_state_change
+
+  # Zone switch state change
+  - platform: state
+    entity_id: !input switched_device
+    for:
+      seconds: 5
+    id: switch_state_change
+
+  # Away switch state chnage
+  - platform: state
+    entity_id: !input away_mode
+    id: away_mode_state_change
+
+  # Echoblock timer end 
+  - platform: state
+    entity_id: !input echoblock_timer
+    from: active
+    to: idle
+    id: echoblock_timer_end
+
+# - platform: time_pattern
+# At interval re-checks the state.
+# Can be used to pick up missed events etc. Should not be necessary
+#   between event_start, calendar on and availability of data
+#   minutes: "/1"
+#   id: catchall_interval
+
+action:
+  ## -------------------------------------------------------------------------------------------------
+  ## ACTION[0] -- LOG THE TRIGGER
+  ## -------------------------------------------------------------------------------------------------
+  - service: script.logfile_entry
+    data: 
+      notification_service: !input logging_service_name
+      logfile_title: Zone Switch Z2
+      message_preamble: "{{ log_message_preamble }}"
+      message_body: ---
+
+  # Log the trigger details 
+  - service: script.logfile_entry
+    data: 
+      notification_service: !input logging_service_name
+      logfile_title: Zone Switch Z2
+      message_preamble: "{{ log_message_preamble }}"
+      message_body: >
+        {% if trigger.id is undefined %}
+          {{ "Run manually." }} 
+        {% elif trigger.entity_id is undefined %}
+          {{ "Triggered by: " + trigger.id | string + " (no entity id)" }}
+        {% else %} 
+          {{ "Triggered by: " + trigger.id | string + " from '" + state_attr(trigger.entity_id, 'friendly_name') + "', state = " + states(trigger.entity_id) }}
+        {% endif %}
+
+  ## -------------------------------------------------------------------------------------------------
+  ## ACTION[1] -- RESPOND TO TRIGGERS WHERE NECESSARY
+  ## (not all triggers require an individual response)
+  ## -------------------------------------------------------------------------------------------------
+  - choose:
+      #
+      # ACTION[1]CHOOSE[0] Switch state change -- either an echo or a manual change (which is disallowed) 
+      #
+      - conditions:
+          - condition: trigger
+            id: switch_state_change
+        sequence:
+          - if:
+              - condition: state
+                entity_id: !input echoblock_timer
+                state: active 
+            then:
+              # the state change is legit, log that the trigger is ignored 
+              - service: script.logfile_entry
+                data: 
+                  notification_service: !input logging_service_name
+                  logfile_title: Zone Switch Z2
+                  message_preamble: "{{ log_message_preamble }}"
+                  message_body: >
+                    {{ "Set state ignored during echo block period" }}
+              # Stop
+              - stop: "trigger ignored during echoblock" 
+            else:
+              # state change not allowwed, reset
+              # log that the trigger is ignored
+              - service: script.logfile_entry
+                data: 
+                  notification_service: !input logging_service_name
+                  logfile_title: Zone Switch Z2
+                  message_preamble: "{{ log_message_preamble }}"
+                  message_body: >
+                    {{ "Manual change of state not allowed; will be reset" }}
+              # now continue (no stop), to reset the switch as it should be 
+      #
+      # ACTION[1]CHOOSE[1] Echoblock timer end
+      # Check whether the switched device responded correctly to the new setting
+      #
+      - conditions:
+          - condition: trigger
+            id: echoblock_timer_end
+        sequence:
+          - choose:
+              # If the device is unknown
+              - conditions: 
+                  - condition: template
+                    value_template: "{{ states(local_switched_device) == 'unknown' }}"
+                sequence:
+                  # Create a notification
+                  - service: persistent_notification.create
+                    data:
+                      title: "Zone Switch Z2"
+                      message: >
+                        {{ " The device '" + state_attr(local_switched_device, 'friendly_name') | default("xxxxxx") + "' is unknown" }}
+                      notification_id: >
+                        {{ local_switched_device }} 
+                      # to prevent duplicate notifications
+                    continue_on_error: true 
+                  #
+                  # log the notification
+                  - service: script.logfile_entry
+                    data: 
+                      notification_service: !input logging_service_name
+                      logfile_title: Zone Switch Z2
+                      message_preamble: "{{ log_message_preamble }}"
+                      message_body: >
+                        {{ "The device '" + state_attr(local_switched_device, 'friendly_name') | default("xxxxxx") + "' is unknown" }}
+
+              # If the device is unavailable
+              - conditions: 
+                  - condition: template
+                    value_template: "{{ states(local_switched_device) == 'unavailable' }}"
+                sequence:
+                  # Create a notification
+                  - service: persistent_notification.create
+                    data:
+                      title: "Zone Switch Z2"
+                      message: >
+                        {{ " The device '" + state_attr(local_switched_device, 'friendly_name') | default("xxxxxx") + "' is unavailable" }}
+                      notification_id: >
+                        {{ local_switched_device }} 
+                      # to prevent duplicate notifications
+                    continue_on_error: true 
+                  #
+                  # log the notification
+                  - service: script.logfile_entry
+                    data: 
+                      notification_service: !input logging_service_name
+                      logfile_title: Zone Switch Z2
+                      message_preamble: "{{ log_message_preamble }}"
+                      message_body: >
+                        {{ "The device '" + state_attr(local_switched_device, 'friendly_name') | default("xxxxxx") + "' is unavailable" }}
+
+              # If the device did not respond to the command
+              - conditions:
+                  - condition: template
+                    value_template: "{{ states(local_switched_device) != states(local_required_state) }}"
+                sequence:
+                  # Create a notification
+                  - service: persistent_notification.create
+                    data:
+                      title: "Zone Switch Z2"
+                      message: >
+                        {{ "The device '" + state_attr(local_switched_device, 'friendly_name') + "' did not respond correctly. Tried to set to " + states(local_required_state) | string + "; actual setting " +  states(local_switched_device) | string + "." }}
+                      notification_id: "{{ local_switched_device }}" # to prevent duplicate notifications for same device
+                  # log the notification
+                  - service: script.logfile_entry
+                    data: 
+                      notification_service: !input logging_service_name
+                      logfile_title: Zone Switch Z2
+                      message_preamble: "{{ log_message_preamble }}"
+                      message_body: >
+                        {{ "The device '" + state_attr(local_switched_device, 'friendly_name') + "' did not respond correctly. Tried to set to " + states(local_required_state) | string + "; actual setting " +  states(local_switched_device) | string + "." }}
+
+            default: # it is OK
+              # Dismiss any notification
+              - service: persistent_notification.dismiss 
+                data:
+                  notification_id: >
+                    {{ local_switched_device }} 
+                  # to prevent duplicate notifications
+                continue_on_error: true
+              # Log the notification  
+              - service: script.logfile_entry
+                data: 
+                  notification_service: !input logging_service_name
+                  logfile_title: Zone Switch Z2
+                  message_preamble: "{{ log_message_preamble }}"
+                  message_body: >
+                    {{ "The device '" + state_attr(local_switched_device, 'friendly_name') + "' is set correctly." }}
+          #
+          # Stop. Otherwise the automation keeps repeating when a device is not responding.
+          #
+          - stop: "No further action after checking the previous setting"
+          # --------------------------------------------------------------------
+  ##
+  ## -------------------------------------------------------------------------------------------------
+  ## ACTION[2] -- DETERMINE THE REQUIRED SWITCH STATE
+  ## -------------------------------------------------------------------------------------------------
+  ##
+  ## Each choice sets the required state and the reason text, for later use
+  ## The states are tested in order of their priority over other states
+  - choose:
+      # ACTION[2].CHOOSE[0]. If 'away' switch is on
+      - conditions:
+          - condition: template
+            value_template: "{{ states(local_away_mode) != '' }}" # test whether an away switch was specified
+          - condition: state
+            entity_id: !input away_mode
+            state: "on"
+        sequence:
+          - service: input_boolean.turn_off
+            target:
+              entity_id: !input required_state
+          - service: input_text.set_value
+            data:
+              value: >
+                {% if state_attr(local_setting_reason, 'max') < 255 %} 
+                  {{ "**Error! Setting reason helper max length must be 255**" }}
+                {% else %}
+                  {{ "Turned off because away mode is turned on." }}
+                {% endif %}
+            target:
+              entity_id: !input setting_reason
+
+      # ACTION[2].CHOOSE[1]. If demand sensor is on
+      - conditions:
+          - condition: state
+            entity_id: !input demand_sensor
+            state: "on"
+        sequence:
+          - service: input_boolean.turn_on
+            target:
+              entity_id: !input required_state
+          - service: input_text.set_value
+            data:
+              value: >
+                {% if state_attr(local_setting_reason, 'max') < 255 %} 
+                  {{ "**Error! Setting reason helper max length must be 255**" }}
+                {% else %}
+                  {{ "Turned on because there is a heat demand" }}
+                {% endif %}
+            target:
+              entity_id: !input setting_reason
+
+      # ACTION[2].CHOOSE[2]. If the demand sensor is off 
+      - conditions:
+          - condition: state
+            entity_id: !input demand_sensor
+            state: "off"
+        sequence:
+          - service: input_boolean.turn_off
+            target:
+              entity_id: !input required_state
+          - service: input_text.set_value
+            data:
+              value: >
+                {% if state_attr(local_setting_reason, 'max') < 255 %} 
+                  {{ "**Error! Setting reason helper max length must be 255**" }}
+                {% else %}
+                  {{ "Turned off because there is no heat demand" }}
+                {% endif %}
+            target:
+              entity_id: !input setting_reason
+
+      #ACTION[2].CHOOSE[3]. If the heat demand sensor becomes unknown
+      - conditions:
+          - condition: state
+            entity_id: !input demand_sensor
+            state: "unknown"
+        sequence:
+          - service: input_boolean.turn_off
+            target:
+              entity_id: !input required_state
+          - service: input_text.set_value
+            data:
+              value: >
+                {% if state_attr(local_setting_reason, 'max') < 255 %} 
+                  {{ "**Error! Setting reason helper max length must be 255**" }}
+                {% else %}
+                  {{ 'Turned off because the heat demand sensor is unknown' }}
+                {% endif %}
+            target:
+              entity_id: !input setting_reason
+
+      #ACTION[2].CHOOSE[4]. If the heat demand sensor becomes unavailable
+      - conditions:
+          - condition: state
+            entity_id: !input demand_sensor
+            state: "unavailable"
+        sequence:
+          - service: input_boolean.turn_off
+            target:
+              entity_id: !input required_state
+          - service: input_text.set_value
+            data:
+              value: >
+                {% if state_attr(local_setting_reason, 'max') < 255 %} 
+                  {{ "**Error! Setting reason helper max length must be 255**" }}
+                {% else %}
+                  {{ 'Turned off because the heat demand sensor is unavailable.' }}
+                {% endif %}
+            target:
+              entity_id: !input setting_reason
+
+    # ACTION[2].Default - should never happen!
+    default:
+      - service: input_boolean.turn_off
+        target:
+          entity_id: !input required_state
+      - service: input_text.set_value
+        data:
+          value: >
+            {% if state_attr(local_setting_reason, 'max') < 255 %} 
+              {{ "**Error! Setting reason helper max length must be 255**" }}
+            {% else %}
+              {{ "Turned off by because device state canot be determined (program error)" }}
+            {% endif %}
+        target:
+          entity_id: !input setting_reason
+
+  ## -------------------------------------------------------------------------------------------------
+  ## ACTION[3] -- SEND STATE CHANGE TO THE SWITCHED DEVICES (BUT ONLY WHEN NECESSARY)
+  ## -------------------------------------------------------------------------------------------------
+
+  # ACTION[3].SEQUENCE[0]. Check whether a change to the setting is required
+  - choose: 
+    #
+    # ACTION[3].SEQUENCE[0].CHOOSE[0]
+    # Device unknown 
+    - conditions: 
+        - condition: state
+          entity_id: !input switched_device
+          state: "unknown"
+      sequence:
+        # Create a notification
+        - service: persistent_notification.create
+          data:
+            title: "Zone Switch Z2"
+            message: >
+              {{ "The device '"  + local_switched_device | string + "' is unknown!" }}
+            notification_id: "{{ local_switched_device }}"
+            # to prevent duplcate notifications
+        # log entry  
+        - service: script.logfile_entry
+          data: 
+            notification_service: !input logging_service_name
+            logfile_title: Zone Switch Z2
+            message_preamble: "{{ log_message_preamble }}"
+            message_body: >
+              {{ "The device '" + local_switched_device | string + "' is unknown" }}  
+    #
+    # ACTION[6].SEQUENCE[0].CHOOSE[1]
+    # Device unavailable
+    - conditions:
+        - condition: state
+          entity_id: !input switched_device
+          state: "unavailable"
+      sequence: 
+        # Create a notification
+        - service: persistent_notification.create
+          data:
+            title: "Zone Switch Z2"
+            message: >
+              {{ "The device '" + state_attr(local_switched_device, 'friendly_name') | string + "' is offline" }}
+            notification_id: >
+              {{ local_switched_device }} 
+            # to prevent duplcate notifications
+        # Log entry
+        - service: script.logfile_entry
+          data: 
+            notification_service: !input logging_service_name
+            logfile_title: Zone Switch Z2
+            message_preamble: "{{ log_message_preamble }}"
+            message_body: >
+              {{ "The device '" + state_attr(local_switched_device, 'friendly_name') | string + "' is unavailable" }} 
+    #
+    # ACTION[6].SEQUENCE[0].CHOOSE[2]
+    # Device is already in the right state 
+    - conditions: > 
+        {{ states(local_switched_device) == states(local_required_state) }}
+      sequence:
+        # dismiss any previous notifiations as the device is now apparently online  
+        - service: persistent_notification.dismiss
+          data:
+            notification_id: "{{ local_switched_device }}"
+        # Log entry 
+        - service: script.logfile_entry
+          data: 
+            notification_service: !input logging_service_name
+            logfile_title: Zone Switch Z2
+            message_preamble: "{{ log_message_preamble }}"
+            message_body: >
+              {{ "The device '" + state_attr(local_switched_device, 'friendly_name') | string + "' is already set to " + states(local_required_state) | string }} 
+    #
+    # ACTION[6].SEQUENCE[0].DEFAULT
+    # Device state needs to be changed
+    default:
+      # parallel ensures completion even if switch.turn_on/off fails 
+      - parallel: 
+          # dismiss any previous notifications as the device is now apparently online 
+          - service: persistent_notification.dismiss
+            data:
+              notification_id: "{{ local_switched_device }}"
+          #
+          # Send the command
+          - if: 
+              condition: template  
+              value_template: >
+                {{ states(local_required_state) == "on" }} 
+            then:
+              - service: switch.turn_on
+                continue_on_error: true 
+                target:
+                  entity_id: >
+                    {{ local_switched_device }}
+            else:
+              - service: switch.turn_off
+                continue_on_error: true 
+                target:
+                  entity_id: >
+                    {{ local_switched_device }}
+          #
+          # log the command
+          - service: script.logfile_entry
+            data: 
+              notification_service: !input logging_service_name
+              logfile_title: Zone Switch Z2
+              message_preamble: "{{ log_message_preamble }}"
+              message_body: >
+                {{ "The device '" + state_attr(local_switched_device, 'friendly_name') | string + "' is set to " + states(local_required_state) | string }}
+          #
+          # Start the echoblock timer
+          # Only starts if there is a change. 
+          - service: timer.start
+            data:
+              duration:
+                seconds: 10
+            target:
+              entity_id: !input echoblock_timer
+  #
+  # ACTION[7] log the reason
+  #
+  - service: script.logfile_entry
+    data: 
+      notification_service: !input logging_service_name
+      logfile_title: Zone Switch Z2
+      message_preamble: "{{ log_message_preamble }}"
+      message_body: >
+        {{ "New state: " + states(local_setting_reason) | string }}

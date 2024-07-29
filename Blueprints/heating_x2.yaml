@@ -1,0 +1,1249 @@
+### ------------------------------------------------------------------------------------------------
+###
+###      HEATING X2
+###      ----------
+###
+### Release 1 (Feb 2023) had the following features
+###   Controls one or more thermostats from a calendar
+###   Allows temporary manual override
+###   Optionally turns off thermostat if a door or window is opened,
+###   Optionally turns off thermostat if the room is unoccupied for a while.
+###
+### Release 2 (06-Feb-2024) adds the following features
+###   Background temperature input. Used when there is no active calendar event or room
+###      is unoccupied.
+###   Away mode. Changes the heating of all rooms to the 'away temperature' input.
+###   Thermostat battery life saved by transmitting only when there is an actual change.
+###   Sends a notification if a thermostat is unavailable or not responding to settings.
+###
+### Release 2.1 (24-Feb-2024)
+###   Still called X2, compatible with 2.0
+###   New code to extract the current event from the calendar more reliably.
+###   Robust for consecutive and overlapping events with no delay or continual refresh
+###   'Current event' is now the one that started latest
+###   Will revert to previous active event when overlapping events finish
+###   There can be any number of overlaps
+###
+### Release 2.2 (27-Feb-2024)
+###   Still called X2, compatible with 2.0 and 2.1
+###   Adds optional logging. Specify log file notification entity in new blueprint parameter
+###   Default is blank = no logging (as before)
+###
+### Minor updates (for robustness):
+###   01-Mar-2024: 2.2.01  Code added to check that the 'setting reason' input_text helper has a max length of 255 characters. Default is 100, which is too short. If not set to 255, an error message is written into the 'setting reason'.
+###   02-Mar-2024: 2.2.02  Added an id to the away_switch_on and _off triggers, now separated, for logging purposes
+###   05-Mar-2024: 2.2.03  Added detail to the trigger line of the log entries 
+###   08-Mar-2024: 2.2.04  Correct trigger line of the log entries when calendar event triggers have no entity_id
+###   09-Mar-2024: 2.2.05  Tidied up logic of ACTION[6] using choose, to ensure there is always a log message
+###   09-Mar-2024: 2.2.06  Warmup timer reset only if nothing is scheduled (previously sometimes premature with consecutive events) 
+###   09-Mar-2024: 2.2.07  Improved notifications. Additional unknown and offline every time a setting is needed. Dismissed when online. Only ever one notification per device. 
+###   09-Mar-2024: 2.2.08  Now ignores false 'set temperature change' from a device when it goes unavailable, and other out of range (false) temperature settings
+###   13-Mar-2024: 2.2.09  Added 'continue_on_error' and 'parallel' to thermostat service call, 'continue_on_error' to logs and notifications to better cope with device errors 
+###   14-Mar-2024: 2.2.10  Thermostat available trigger time increased and now resets manual override, because sometimes TRVs go offline for just a few seconds (might be a ZHA glitch?)
+###   14-Mar-2024: 2.2.11  Turning away mode on or off now cancels the manual override timer and warmup timer
+###   14-Mar-2024: 2.2.12  Added further unknown and uavavailality tests on echoblock timer end (even though this is already checked when setting)  
+###   16-Mar-2024: 2.2.13  Changed logging to use the new script.heating_xyz_logfile_entry (making the code more compact and maintainable) 
+###   18-Jun-2024: 2.2.14  Changed the name of script heating_xyz_logfile_entry to just logfile_entry
+###
+### OVERVIEW
+### The main action steps are as follows.
+### The numbering correspnds to that used by the system log for error messages.
+### ACTION[0] -- LOG THE TRIGGER. Starts a new log file entry by writing a bank line and the trigger id
+### ACTIONS[1-3] -- FETCH THE CURRENT AND NEXT CALENDAR EVENTS
+###              Calls calendar.get_events twice, then sets local variables for later use
+### ACTION[4] -- RESPOND TO TRIGGERS WHERE NECESSARY. A big choose statement on the trigger_id.
+### ACTION[5] -- DETERMINE THE REQUIRED TEMPERATURE ACCORDING TO THE STATE. A big chooose statement on the relevant states variables.
+###              Decides what teperature is required and why. Sets the 'required temperature' helper and the 'reason test' helper.
+### ACTION[6] -- SEND TEMPERATURE CHANGE TO THE THERMOSTATS
+###              Loops through all the thermostats for the room. If the required temperature is
+###              different from the actual one, the service call to change it is invoked and the echoblock (response timerout) timer started.
+### ACTION[7] -- LOG THE REASON. Writes the last line of the log file entry
+###
+### ------------------------------------------------------------------------------------------------
+
+blueprint:
+  name: "Heating X2 Test"
+  description: Controls one or more thermostats from a calendar, allows temporary manual override, and optionally adjusts thermostat if a door or window is opened, or if the room is unoccupied for a while.
+  domain: automation
+
+  ### ----------------------------------------------------------------------------------------------
+  ### INPUTS
+  ### ----------------------------------------------------------------------------------------------
+
+  input:
+    thermostat_controls:
+      name: DEVICE ENTITY - Thermostat control (mandatory)
+      description: One or more thermostat entities that are to be controlled by this automation
+      selector:
+        entity:
+          filter:
+            domain: climate
+          multiple: true
+
+    door_or_window_open_sensors:
+      name: DEVICE ENTITY - Door or window open sensors (if applicable)
+      description: Zero or more sensors that detect whether a door or window is open
+      selector:
+        entity:
+          filter:
+            domain: binary_sensor
+            device_class: opening
+          multiple: true
+      default: []
+
+    room_occupancy_sensors:
+      name: DEVICE ENTITY - room occupancy sensors (if applicable)
+      description: Zero or more sensors that detect whether there is anyone in the room
+      selector:
+        entity:
+          filter:
+            domain: binary_sensor
+            device_class: occupancy
+          multiple: true
+      default: []
+
+    away_switch:
+      name: DEVİCE ENTITY - Away switch, binary sensor or input boolean (if required)
+      description: A switch, input boolean, or binary sensor that changes all rooms to 'away' mode
+      selector:
+        entity:
+      default: []
+
+    room_calendar:
+      name: CALENDAR ENTITY - room calendar (mandatory)
+      description: The calendar dedicated to scheduling events for this room
+      selector:
+        entity:
+          filter:
+            domain: calendar
+
+    manual_temperature:
+      name: HELPER -  Manual temperature (mandatory)
+      description: The global variable (helper) to hold the manually selected temperature
+      selector:
+        entity:
+          filter:
+            domain: input_number
+
+    required_temperature:
+      name: HELPER - Required temperature (mandatory)
+      description: The global variable (helper) to hold the required temperature
+      selector:
+        entity:
+          filter:
+            domain: input_number
+
+    setting_reason:
+      name: HELPER - Setting reason (mandatory)
+      description: The global variable (helper) into which the automation writes the reason for the current setting (for use on a dashboard)
+      selector:
+        entity:
+          filter:
+            domain: input_text
+
+    door_or_window_open_timer:
+      name: HELPER - Door or window open timer (mandatory, even if there are no sensors)
+      description: The global variable (helper) to hold the timer for the period since a door or window was opened
+      selector:
+        entity:
+          filter:
+            domain: timer
+
+    unoccupancy_timer:
+      name: HELPER - Unoccupancy timer (mandatory, even if there are no sensors)
+      description: The global variable (helper) to hold the timer for the period since the room was last unoccupied
+      selector:
+        entity:
+          filter:
+            domain: timer
+
+    warmup_timer:
+      name: HELPER - Warmup timer (mandatory)
+      description: The global variable (helper) to hold the timer for the event warmup period
+      selector:
+        entity:
+          filter:
+            domain: timer
+
+    manual_override_timer:
+      name: HELPER - Manual override timer (mandatory)
+      description: The global variable (helper) to hold the timer for a manual intervention
+      selector:
+        entity:
+          filter:
+            domain: timer
+
+    echoblock_timer:
+      name: HELPER - Echoblock timer (mandatory)
+      description: The timer for use inside the automation to disinguish genuine manual changes of the set temperature from those set by the automation
+      selector:
+        entity:
+          filter:
+            domain: timer
+
+    minimum_thermostat_temperature:
+      name: PARAMETER - Minimum thermostat device temperature (frost settting)
+      description: The minimum temperature that can be set on the thermostat. Used to check the value supplied in a calendar and as a frost setting when a door or window is open. Usually 5C.
+      selector:
+        number:
+          min: 0
+          max: 100
+      default: 5
+
+    maximum_thermostat_temperature:
+      name: PARAMETER - Maximum thermostat device temperature
+      description: The maximum temperature that can be set on the thermostat. Used to check the value supplied in a calendar. Typically 30 for a thermostat or 70 for a water heater.
+      selector:
+        number:
+          min: 0
+          max: 100
+      default: 30
+
+    away_temperature:
+      name: PARAMETER - Away temperature
+      description: The temperature to be used when away mode is in operation
+      selector:
+        number:
+          min: 0
+          max: 100
+      default: 6
+
+    background_temperature:
+      name: PARAMETER - Background temperature setting
+      description: The temperature to be used when there is no calendar event or the room is unoccupied
+      selector:
+        number:
+          min: 0
+          max: 100
+      default: 10
+
+    warmup_period:
+      name: PARAMETER - Warmup period
+      description: The period of time from the start of a new event for which room unoccupancy will be ignored
+      selector:
+        time:
+      default: "02:00:00"
+
+    manual_override_period:
+      name: PARAMETER - Manual override period
+      description: The time period for which a manual intervention will override the schedule
+      selector:
+        time:
+      default: "02:00:00"
+
+    door_or_window_open_period:
+      name: PARAMETER - Door or window open period
+      description: The time period for which a door or window may be open before the heating is turned off
+      selector:
+        time:
+      default: "0:03:00"
+
+    unoccupancy_period:
+      name: PARAMETER - Unoccupancy period
+      description: The time period for which the room may be unoccupied before the heating is turned off
+      selector:
+        time:
+      default: "01:00:00"
+
+    logging_service_name:
+      name: LOGGING - Specify the service for logging
+      description: Enter service name (not filename) as a string
+      default: ""
+
+mode: queued # use all triggers but avoid conflicting states
+
+## -------------------------------------------------------------------------------------------------
+## LOCAL VARİABLES
+## Constants, and input variable values for use in templates
+## -------------------------------------------------------------------------------------------------
+
+variables:
+  # Parameters -- hold the actual value
+  local_maximum_thermostat_temperature: !input maximum_thermostat_temperature
+  local_minimum_thermostat_temperature: !input minimum_thermostat_temperature
+  local_away_temperature: !input away_temperature
+  local_background_temperature: !input background_temperature
+
+  # Devices and helpers -- hold the entity
+  local_away_switch: !input away_switch
+  local_thermostat_controls: !input thermostat_controls
+  local_door_or_window_open_sensors: !input door_or_window_open_sensors
+  local_door_or_window_open_timer: !input door_or_window_open_timer
+  local_echoblock_timer: !input echoblock_timer
+  local_required_temperature: !input required_temperature
+  local_manual_temperature: !input manual_temperature
+  local_manual_override_timer: !input manual_override_timer
+  local_room_calendar: !input room_calendar
+  local_setting_reason: !input setting_reason
+  local_room_occupancy_sensors: !input room_occupancy_sensors
+  local_unoccupancy_timer: !input unoccupancy_timer
+
+  # Handy constants
+  # identifies the source of the log messages
+  log_message_preamble: >
+    {{ this.attributes.friendly_name }}
+
+
+## -------------------------------------------------------------------------------------------------
+## TRIGGERS
+## -------------------------------------------------------------------------------------------------
+
+trigger:
+  - platform: homeassistant
+    event: start
+    id: startup
+
+  # Calendar event start
+  - platform: calendar
+    event: start
+    offset: "00:00:00"
+    entity_id: !input room_calendar
+    id: calendar_event_start
+
+  # Calendar event end
+  - platform: calendar
+    event: end
+    offset: "00:00:00"
+    entity_id: !input room_calendar
+    id: calendar_event_end
+
+  # Thermostat becomes unavailable
+  - platform: state
+    entity_id: !input thermostat_controls
+    to: unavailable
+    for:
+      seconds: 60 
+    id: thermostat_unavailable
+
+  # Thermostat becomes available
+  - platform: state
+    entity_id: !input thermostat_controls
+    from: unavailable
+    for:
+      seconds: 60
+    id: thermostat_available
+
+  # Change in any one of the thermostats' set temperature
+  - platform: state
+    entity_id: !input thermostat_controls
+    attribute: temperature
+    for:
+      seconds: 5
+    id: set_temperature_change
+
+  # End of manual override (timer idle, unknown, or unavailable)
+  - platform: state
+    entity_id: !input manual_override_timer
+    from: active
+    id: manual_override_end
+
+  # Room occupancy sensor any change
+  - platform: state
+    entity_id: !input room_occupancy_sensors
+    for:
+      seconds: 5
+    id: room_occupancy_change
+
+  # Door or window sensor any change
+  - platform: state
+    entity_id: !input door_or_window_open_sensors
+    for:
+      seconds: 5
+    id: door_or_window_change
+
+  # Door or window open timer finished (time to turn off the heating)
+  - platform: state
+    entity_id: !input door_or_window_open_timer
+    from: active
+    id: door_or_window_open_timer_end
+
+  # Unoccupancy timer finished (time to turn off the heating)
+  - platform: state
+    entity_id: !input unoccupancy_timer
+    from: active
+    id: unoccupancy_timer_end
+
+  # Away mode change
+  - platform: state
+    entity_id: !input away_switch
+    id: away_mode_change
+
+  # End of warmup period
+  - platform: state
+    entity_id: !input warmup_timer
+    from: active
+    id: warmup_timer_end
+
+  # Echoblock timer end -- Check whether the thermostat responded
+  - platform: state
+    entity_id: !input echoblock_timer
+    from: active
+    to: idle
+    id: echoblock_timer_end
+
+# - platform: time_pattern
+# At interval re-checks the state.
+# Can be used to pick up missed events etc. Should not be necessary
+#   between event_start, calendar on and availability of data
+#   minutes: "/1"
+#   id: catchall_interval
+
+action:
+  ## -------------------------------------------------------------------------------------------------
+  ## ACTION[0] -- LOG THE TRIGGER
+  ## -------------------------------------------------------------------------------------------------
+  # First a blank line to start the new entry 
+  - service: script.logfile_entry
+    data: 
+      notification_service: !input logging_service_name
+      logfile_title: Heating X2
+      message_preamble: "{{ log_message_preamble }}"
+      message_body: ---
+
+  # Then the trigger details line 
+  - service: script.logfile_entry
+    data: 
+      notification_service: !input logging_service_name
+      logfile_title: Heating X2
+      message_preamble: "{{ log_message_preamble }}"
+      message_body: >
+        {% if trigger.id is undefined %}
+          {{ "Run manually." }} 
+        {% elif trigger.entity_id is undefined %}
+          {{ "Triggered by: " + trigger.id | string + " (no entity id)" }}
+        {% else %} 
+          {{ "Triggered by: " + trigger.id | string + " from '" + state_attr(trigger.entity_id, 'friendly_name') + "', state = " + states(trigger.entity_id) }}
+        {% endif %}
+
+  ## -------------------------------------------------------------------------------------------------
+  ## ACTIONS[1-3] -- FETCH THE CURRENT AND NEXT EVENTS FROM THE CALENDAR
+  ## Current event is the one that started last
+  ## -------------------------------------------------------------------------------------------------
+  - service: calendar.get_events
+    target:
+      entity_id: !input room_calendar
+    data:
+      duration:
+        hours: 0
+        minutes: 0
+        seconds: 1
+    response_variable: active_events
+
+  - service: calendar.get_events
+    target:
+      entity_id: !input room_calendar
+    data:
+      duration:
+        hours: 24
+        minutes: 0
+        seconds: 0
+    response_variable: future_events
+
+  - variables:
+      any_event_active: >
+        {{ active_events[local_room_calendar].events | count > 0 }}
+      current_event: >
+        {{ active_events[local_room_calendar].events | sort(attribute ='start') | list | last | default("") }}
+      any_future_event: >
+        {{ future_events[local_room_calendar].events | count > 0 }}
+      next_event: >
+        {{ future_events[local_room_calendar].events | sort(attribute ='start') | list | first | default ("") }}
+
+  ## -------------------------------------------------------------------------------------------------
+  ## ACTION[4] -- RESPOND TO TRIGGERS WHERE NECESSARY
+  ## (not all triggers require an individual response)
+  ## -------------------------------------------------------------------------------------------------
+
+  # Each choice responds to a specific trigger (where a response is needed))
+  - choose:
+      #
+      # ACTION[4]CHOOSE[0] Set temperature change (could be a manual override start)
+      #
+      - conditions:
+          - condition: trigger
+            id: set_temperature_change
+        sequence:
+          - choose:
+            # ACTION[4].CHOOSE[0].SEQUENCE[0].CHOOSE[0]
+            # False set temperature from a device when it goes offline 
+            - conditions: 
+                - condition: template
+                  value_template: >
+                    {{ states(trigger.entity_id) == 'unavailable' }}
+              sequence:
+                # log that the trigger is ignored
+                - service: script.logfile_entry
+                  data: 
+                    notification_service: !input logging_service_name
+                    logfile_title: Heating X2
+                    message_preamble: "{{ log_message_preamble }}"
+                    message_body: >
+                      {{ "Set temperature change ignored because the device was going offline" }}
+                # Stop
+                - stop: "trigger ignored because the device was going offline"
+            #
+            # ACTION[4].CHOOSE[0].SEQUENCE[0].CHOOSE[1]
+            # Ignore 'echos' -- set temperature changes caused by this automation 
+            - conditions: > 
+                {{ states(local_echoblock_timer) != 'idle' }}
+              sequence: 
+                # log that the trigger is ignored
+                - service: script.logfile_entry
+                  data: 
+                    notification_service: !input logging_service_name
+                    logfile_title: Heating X2
+                    message_preamble: "{{ log_message_preamble }}"
+                    message_body: >
+                      {{ "Set temperature change ignored because it is an echo of a command from this automation" }}
+                # Stop
+                - stop: "trigger ignored because it is an echo"
+            #
+            # ACTION[4].CHOOSE[0].SEQUENCE[0].CHOOSE[2]
+            # Ignore set temperature changes too low   
+            - conditions: > 
+                {{ state_attr(trigger.entity_id, 'temperature') | float(0) | round(1) < local_minimum_thermostat_temperature | float(0) | round(1) }} 
+              sequence: 
+              # log that the trigger is ignored
+                - service: script.logfile_entry
+                  data: 
+                    notification_service: !input logging_service_name
+                    logfile_title: Heating X2
+                    message_preamble: "{{ log_message_preamble }}"
+                    message_body: >
+                        {{ "Set temperature change ignored because " + state_attr(trigger.entity_id, 'temperature') | float(0) | round(1) + " is below the minimum for his device"}}
+                # Stop
+                - stop: "trigger ignored because temperaure too low"
+            #
+            # ACTION[4].CHOOSE[0].SEQUENCE[0].CHOOSE[3]
+            # Ignore set temperature changes too high 
+            - conditions: > 
+                {{ state_attr(trigger.entity_id, 'temperature') | float(0) | round(1) > local_maximum_thermostat_temperature | float(0) | round(1) }} 
+              sequence: 
+                # log that the trigger is ignored
+                - service: script.logfile_entry
+                  data: 
+                    notification_service: !input logging_service_name
+                    logfile_title: Heating X2
+                    message_preamble: "{{ log_message_preamble }}"
+                    message_body: >
+                      {{ "Set temperature change ignored because " + state_attr(trigger.entity_id, 'temperature') | float(0) | round(1) + " is above the maximum for his device"}}
+                # Stop
+                - stop: "trigger ignored because temperaure too high"
+            #
+            # ACTION[4].CHOOSE[0].SEQUENCE[0].DEFAULT
+            # Start manual override  
+            default: 
+              - service: timer.start
+                target:
+                  entity_id: !input manual_override_timer
+                data:
+                  duration: !input manual_override_period
+              # set the manual value into the helper
+              - service: input_number.set_value
+                target:
+                  entity_id: !input manual_temperature
+                data:
+                  value: >
+                    {{ state_attr(trigger.entity_id, 'temperature') | float(0) | round(1) }}
+                  # the temperature of whichever thermostat triggered the automation
+      #
+      # ACTION[4]CHOOSE[1] Door or window sensor change
+      #
+      - conditions:
+          - condition: trigger
+            id: door_or_window_change
+        sequence:
+          - if: # there is now any door or window open
+              - condition: template
+                value_template: "{{ local_door_or_window_open_sensors | select ('is_state', 'on') | list | count > 0 }}" # ANY ONE (working) sensor = open
+            then:
+              - if: # There was NOT already a door or window open
+                  - condition: state
+                    entity_id: !input door_or_window_open_timer
+                    state: paused
+                then: # Restart the timer
+                  - service: timer.start
+                    data:
+                      duration: !input door_or_window_open_period
+                    target:
+                      entity_id: !input door_or_window_open_timer
+                # else there was already a door or window open and the timer is already running
+                #
+            else: # there is now no door or window open: pause and reset timer
+              - service: timer.start
+                data:
+                  duration: !input door_or_window_open_period
+                target:
+                  entity_id: !input door_or_window_open_timer
+              - service: timer.pause
+                target:
+                  entity_id: !input door_or_window_open_timer
+      #
+      # ACTION[4]CHOOSE[2]. Room occupancy change
+      # Start timer
+      #
+      - conditions:
+          - condition: trigger
+            id: room_occupancy_change
+        sequence:
+          - if: # the room is now unoccupied
+              - condition: template
+                value_template: "{{ local_room_occupancy_sensors | select ('is_state', 'on') | list | count == 0 }}" # NO working sensors show detected = all clear
+            then:
+              - if: # The room was previously occupied
+                  - condition: state
+                    entity_id: !input unoccupancy_timer
+                    state: paused # paused means the room was occupied before
+                then:
+                  - service: timer.start
+                    data:
+                      duration: !input unoccupancy_period
+                    target:
+                      entity_id: !input unoccupancy_timer
+                # else the room sensor already showed unoccupied and the timer is running
+                #
+            else: # the room is now occupied; reset and pause the timer
+              - service: timer.start
+                data:
+                  duration: !input unoccupancy_period
+                target:
+                  entity_id: !input unoccupancy_timer
+              - service: timer.pause
+                target:
+                  entity_id: !input unoccupancy_timer
+      #
+      # ACTION[4]CHOOSE[3] Echoblock timer end
+      # Check whether the thermostats responded correctly to the new setting
+      #
+      - conditions:
+          - condition: trigger
+            id: echoblock_timer_end
+        sequence:
+          - repeat:
+              for_each: !input thermostat_controls
+              sequence:
+                - choose:
+                    # If the thermostat is unknown
+                    - conditions: >
+                          {{ states(repeat.item) == 'unknown' }}
+                      sequence:
+                        # Create a notification
+                        - service: persistent_notification.create
+                          data:
+                            title: "Heating X2"
+                            message: >
+                              {{ " The thermostat '" + state_attr(repeat.item, 'friendly_name') | default("xxxxxx") + "' is unknown" }}
+                            notification_id: >
+                              {{ repeat.item }} 
+                            # to prevent duplcate notifications
+                          continue_on_error: true 
+                        #
+                        # log the notification
+                        - service: script.logfile_entry
+                          data: 
+                            notification_service: !input logging_service_name
+                            logfile_title: Heating X2
+                            message_preamble: "{{ log_message_preamble }}"
+                            message_body: >
+                              {{ "The thermostat '" + state_attr(repeat.item, 'friendly_name') | default("xxxxxx") + "' is unknown" }}
+
+                    # If the thermostat is unavailable 
+                    - conditions: >
+                          {{ states(repeat.item) == 'unavailable' }}
+                      sequence:
+                        # Create a notification
+                        - service: persistent_notification.create
+                          data:
+                            title: "Heating X2"
+                            message: >
+                              {{ " The thermostat '" + state_attr(repeat.item, 'friendly_name') | default("xxxxxx") + "' is unavailable" }}
+                            notification_id: >
+                              {{ repeat.item }} 
+                            # to prevent duplcate notifications
+                          continue_on_error: true 
+                        #
+                        # log the notification
+                        - service: script.logfile_entry
+                          data: 
+                            notification_service: !input logging_service_name
+                            logfile_title: Heating X2
+                            message_preamble: "{{ log_message_preamble }}"
+                            message_body: >
+                              {{ "The thermostat '" + state_attr(repeat.item, 'friendly_name') | default("xxxxxx") + "' is unavailable" }}
+
+                    # The thermostat is not responding to the command
+                    - conditions:
+                        - condition: template
+                          value_template: "{{ not state_attr(repeat.item, 'temperature') | float(-1) | round(1) == states(local_required_temperature) | float(-2) | round(1) }}"
+                      sequence:
+                        # Create a notification
+                        - service: persistent_notification.create
+                          data:
+                            title: "Heating X2"
+                            message: >
+                              {{ " The thermostat '" + state_attr(repeat.item, 'friendly_name') | default("xxxxxx") + "' is not responding correctly. Tried to set to " + states(local_required_temperature) | float(0) | round(1) | string + "; actual setting " +  state_attr(repeat.item, 'temperature') | round(1) | string + "." }}
+                            notification_id: >
+                              {{ repeat.item }} 
+                            # to prevent duplcate notifications
+                          continue_on_error: true 
+                        #
+                        # log the notification
+                        - service: script.logfile_entry
+                          data: 
+                            notification_service: !input logging_service_name
+                            logfile_title: Heating X2
+                            message_preamble: "{{ log_message_preamble }}"
+                            message_body: >
+                              {{ "The thermostat '" + state_attr(repeat.item, 'friendly_name') | default("xxxxxx") + "' is not responding correctly. Tried to set to " + states(local_required_temperature) | float(0) | round(1) | string + "; actual setting " +  state_attr(repeat.item, 'temperature') | float(0) | round(1) | string + "." }}
+                  #
+                  # The thermostat responded correctly
+                  default: 
+                    # dismiss any outstanding notifications
+                    - service: persistent_notification.dismiss
+                      data:
+                        notification_id: "{{ repeat.item }}"
+                      continue_on_error: true
+                    # Log entry 
+                    - service: script.logfile_entry
+                      data: 
+                        notification_service: !input logging_service_name
+                        logfile_title: Heating X2
+                        message_preamble: "{{ log_message_preamble }}"
+                        message_body: >
+                          {{ "The thermostat '" + state_attr(repeat.item, 'friendly_name') | default("xxxxxx") + "' is set correctly." }}
+
+          #
+          # Stop. Otherwise the automation keeps repeating when a thermostat is not responding.
+          #
+          - stop: "No further action after checking the previous setting"
+          # --------------------------------------------------------------------
+
+      #
+      # ACTION[4]CHOOSE[4] Manual override timer end
+      # Reset the manual temperature helper
+      #
+      - conditions:
+          - condition: trigger
+            id: manual_override_end
+        sequence:
+          - service: input_number.set_value
+            target:
+              entity_id: !input manual_temperature
+            data:
+              value: 0
+      #
+      # ACTION[3]CHOOSE[7] Calendar event start
+      # Start warmup timer
+      #
+      - conditions:
+          - condition: trigger
+            id: calendar_event_start
+        sequence:
+          - service: timer.start
+            data:
+              duration: !input warmup_period
+            target:
+              entity_id: !input warmup_timer
+      #
+      # ACTION[4]CHOOSE[8] Calendar event end
+      # Cancel the warmup timer (in case the event was shorter than the warmup)
+      #
+      - conditions:
+          - condition: trigger
+            id: calendar_event_end
+        sequence:
+            # check there is no consecutive event (which will have restarted the timer)
+          - if: 
+            - condition: template
+              value_template: >
+                {{ not any_event_active }}
+            then: 
+              - service: timer.cancel
+                target:
+                  entity_id: !input warmup_timer
+      #
+      # ACTION[4]CHOOSE[9] Thermostat available
+      # Cancel the manual override timer
+      #
+      - conditions:
+          - condition: trigger
+            id: thermostat_available
+        sequence:
+          - service: timer.cancel
+            target:
+              entity_id: !input manual_override_timer
+      #
+      # ACTION[4].CHOOSE[10] Away mode change
+      # Reset manual override and warmup
+      - conditions:
+          - condition: trigger
+            id: away_mode_change
+        sequence:
+          - service: timer.cancel
+            target:
+              entity_id: !input warmup_timer
+          - service: timer.cancel
+            target:
+              entity_id: !input manual_override_timer
+          - service: input_number.set_value
+            target:
+              entity_id: !input manual_temperature
+            data:
+              value: 0
+
+  ## -------------------------------------------------------------------------------------------------
+  ## ACTION[5] -- DETERMINE THE REQUIRED TEMPERATURE ACCORDING TO THE STATE
+  ## -------------------------------------------------------------------------------------------------
+
+  ## Each choice sets the required temperature and the reason text, for later use
+  ## The states are tested in order of their priority over other states
+  - choose:
+      # ACTION[5].CHOOSE[0]. If 'away' switch is on
+      - conditions:
+          - condition: template
+            value_template: "{{ not states(local_away_switch) == '' }}" # test whether an away switch was specified
+          - condition: state
+            entity_id: !input away_switch
+            state: "on"
+        sequence:
+          - service: input_number.set_value
+            data:
+              value: !input away_temperature
+            target:
+              entity_id: !input required_temperature
+          - service: input_text.set_value
+            data:
+              value: >
+                {% if state_attr(local_setting_reason, 'max') < 255 %} 
+                  {{ "**Error! Setting reason helper max length must be 255**" }}
+                {% else %}
+                  {{ "Set to away temperature, " + local_away_temperature | round(1) | string + ", because away mode is turned on." }}
+                {% endif %}
+            target:
+              entity_id: !input setting_reason
+
+      # ACTION[5].CHOOSE[1]. If a door or window is open
+      - conditions:
+          - condition: template
+            value_template: "{{ local_door_or_window_open_sensors | list | count > 0 }}" # There are sensors
+          - condition: state
+            entity_id: !input door_or_window_open_timer
+            state: idle # paused state indicates that no door or window is open; active means we are still waiting
+        sequence:
+          - if: # nevertheless all doors and windows are closed, or there are no sensors (happens at startup)
+              - condition: template
+                value_template: "{{ local_door_or_window_open_sensors | select ('is_state', 'on') | list | count == 0 }}" # NO sensor = open
+            then:
+              - service: timer.start
+                data:
+                  duration: !input door_or_window_open_period
+                target:
+                  entity_id: !input door_or_window_open_timer
+              - service: timer.pause
+                target:
+                  entity_id: !input door_or_window_open_timer
+            else: # door or window open state is genuine
+              - service: input_number.set_value
+                data:
+                  value: !input minimum_thermostat_temperature
+                target:
+                  entity_id: !input required_temperature
+              - service: input_text.set_value
+                data:
+                  value: >
+                    {% if state_attr(local_setting_reason, 'max') < 255 %} 
+                      {{ "**Error! Setting reason helper max length must be 255**" }}
+                    {% else %}
+                      {{ "Set to minimum temperature {{ local_minimum_thermostat_temperature | round(1) }} because a door or window is open" }}
+                    {% endif %}
+                target:
+                  entity_id: !input setting_reason
+
+      # ACTION[5].CHOOSE[2]. If the room is unoccupied and not in warmup
+      - conditions:
+          - condition: template
+            value_template: "{{ local_room_occupancy_sensors | list | count > 0 }}" # There are sensors
+          - condition: state
+            entity_id: !input unoccupancy_timer
+            state: idle # paused state indicates that the room is occupied; active means we are still waiting
+        sequence:
+          choose:
+            - conditions:
+                # nevertheless the room is occupied, or there are no sensors (happens at startup)
+                - condition: template
+                  value_template: "{{ local_room_occupancy_sensors | select ('is_state', 'on') | list | count > 0 }}" # ANY working sensor shows detected
+              sequence:
+                - service: timer.start
+                  data:
+                    duration: !input unoccupancy_period
+                  target:
+                    entity_id: !input unoccupancy_timer
+                - service: timer.pause
+                  target:
+                    entity_id: !input unoccupancy_timer
+
+            - conditions:
+                - condition: state
+                  entity_id: !input warmup_timer
+                  state: idle # ignore if in a warming up period
+              sequence:
+                - service: input_number.set_value
+                  data:
+                    value: !input background_temperature
+                  target:
+                    entity_id: !input required_temperature
+                - service: input_text.set_value
+                  data:
+                    value: >
+                      {% if state_attr(local_setting_reason, 'max') < 255 %} 
+                        {{ "**Error! Setting reason helper max length must be 255**" }}
+                      {% else %}
+                        {{ "Set to background temperature " + local_background_temperature | round(1) + " because the room is unoccupied" }}
+                      {% endif %}
+                  target:
+                    entity_id: !input setting_reason
+
+      # ACTION[5].CHOOSE[3]. If there is a manual override in operation
+      - conditions:
+          - condition: state
+            entity_id: !input manual_override_timer
+            state: active
+        sequence:
+          - service: input_number.set_value
+            data:
+              value: "{{ states(local_manual_temperature) }}"
+            target:
+              entity_id: !input required_temperature
+          - service: input_text.set_value
+            data:
+              value: >
+                {% if state_attr(local_setting_reason, 'max') < 255 %} 
+                  {{ "**Error! Setting reason helper max length must be 255**" }}
+                {% else %}
+                  {{ "Set manually to " + states(local_manual_temperature) + "." }}
+                {% endif %}
+            target:
+              entity_id: !input setting_reason
+
+      # ACTION[5].CHOOSE[4]. If there is an active calendar event
+      - conditions:
+          - condition: template
+            value_template: >
+              {{ any_event_active }}
+        sequence:
+          - choose:
+              # ACTION[4].CHOOSE[4].CONDITION[0].CHOOSE[0]. If there is no temperature field
+              - conditions:
+                  - condition: template
+                    value_template: >-
+                      {{ not current_event.description.split('#') | count >= 3 }}
+                sequence:
+                  - service: input_number.set_value
+                    data:
+                      value: !input background_temperature
+                    target:
+                      entity_id: !input required_temperature
+                  - service: input_text.set_value
+                    data:
+                      value: >
+                        {% if state_attr(local_setting_reason, 'max') < 255 %} 
+                          {{ "**Error! Setting reason helper max length must be 255**" }}
+                        {% else %}
+                          {{ "Set to background temperature, " +  local_background_temperature | round(1) | string + ", because the calendar event '" + current_event.summary | trim + "' does not specify a temperature." }}
+                        {% endif %}
+                    target:
+                      entity_id: !input setting_reason
+
+              # ACTION[5].CHOOSE[4].CONDITION[0].CHOOSE[1]. If temperature field is not a number
+              - conditions:
+                  - condition: template
+                    value_template: "{{ not current_event.description.split('#')[1] | is_number }}"
+                sequence:
+                  - service: input_number.set_value
+                    data:
+                      value: !input background_temperature
+                    target:
+                      entity_id: !input required_temperature
+                  - service: input_text.set_value
+                    data:
+                      value: >-
+                        {% if state_attr(local_setting_reason, 'max') < 255 %} 
+                          {{ "**Error! Setting reason helper max length must be 255**" }}
+                        {% else %}
+                          {{ "Set to background temperature, " +  local_background_temperature | round(1) | string + ", because the calendar event '" + current_event.summary | trim + "' does not specify a valid number for the temperature." }}
+                        {% endif %}
+                    target:
+                      entity_id: !input setting_reason
+
+              # ACTION[5].CHOOSE[4].CONDITION[0].CHOOSE[2].If specified temperature is too low
+              - conditions:
+                  - condition: template
+                    value_template: "{{ not current_event.description.split('#')[1] | float(0) >= local_minimum_thermostat_temperature }}"
+                sequence:
+                  - service: input_number.set_value
+                    data:
+                      value: !input background_temperature
+                    target:
+                      entity_id: !input required_temperature
+                  - service: input_text.set_value
+                    data:
+                      value: >-
+                        {% if state_attr(local_setting_reason, 'max') < 255 %} 
+                          {{ "**Error! Setting reason helper max length must be 255**" }}
+                        {% else %}
+                          {{ "Set to background temperature, " +  local_background_temperature | round(1) | string + ", because the calendar event '" + current_event.summary | trim + "' specifies a temperature below the minimum." }}
+                        {% endif %}
+                    target:
+                      entity_id: !input setting_reason
+
+              # ACTION[5].CHOOSE[4].CONDITION[0].CHOOSE[3].If specified temperature is too high
+              - conditions:
+                  - condition: template
+                    value_template: "{{ not current_event.description.split('#')[1] | float(0) <= local_maximum_thermostat_temperature }}"
+                sequence:
+                  - service: input_number.set_value
+                    data:
+                      value: !input background_temperature
+                    target:
+                      entity_id: !input required_temperature
+                  - service: input_text.set_value
+                    data:
+                      value: >
+                        {% if state_attr(local_setting_reason, 'max') < 255 %} 
+                          {{ "**Error! Setting reason helper max length must be 255**" }}
+                        {% else %}
+                          {{ "Set to background temperature, " + local_background_temperature | round(1) | string + ", because the calendar event '" + current_event.summary | trim + "' specifies a temperature above the maximum." }}
+                        {% endif %}
+                    target:
+                      entity_id: !input setting_reason
+
+            # ACTION[5].CHOOSE[4].CONDITION[0].DEFAULT. Else, the normal case, there is an active calendar event with a valid temperature
+            default:
+              - service: input_number.set_value
+                data:
+                  value: "{{ current_event.description.split('#')[1] | float(0) }}"
+                target:
+                  entity_id: !input required_temperature
+              - service: input_text.set_value
+                data:
+                  value: >
+                    {% if state_attr(local_setting_reason, 'max') < 255 %} 
+                      {{ "**Error! Setting reason helper max length must be 255**" }}
+                    {% else %}
+                      {{ "Set to " + states(local_required_temperature) + " by calendar event '" + current_event.summary | trim + "' until " + as_timestamp(current_event.end) |  timestamp_custom('%a %d %b %Y at %H:%M') + "."  }}
+                    {% endif %}
+                target:
+                  entity_id: !input setting_reason
+
+      # ACTION[5].CHOOSE[5]. If there is no active calendar event
+      - conditions:
+          - condition: template
+            value_template: >
+              {{ not any_event_active }}
+        sequence:
+          - service: input_number.set_value
+            data:
+              value: !input background_temperature
+            target:
+              entity_id: !input required_temperature
+          - service: input_text.set_value
+            data:
+              value: >
+                {% if state_attr(local_setting_reason, 'max') < 255 %} 
+                  {{ "**Error! Setting reason helper max length must be 255**" }}
+                {% else %}
+                  {% if any_future_event %}
+                  {{ "Set to background temperature, " +  local_background_temperature | round(1) | string + ", because nothing is scheduled. The next event is '" + next_event.summary + "' " + as_timestamp(next_event.start) | timestamp_custom('on %a %d %b %Y at %H:%M', false) }}
+                  {% else %}
+                  {{ "Set to background temperature, " +  local_background_temperature | round(1) | string + ", because nothing is scheduled. There are no events scheduled in the next 24 hours." }}
+                  {% endif %}
+                {% endif %}
+            target:
+              entity_id: !input setting_reason
+
+      #ACTION[5].CHOOSE[6]. If the calendar state becomes unknown
+      - conditions:
+          - condition: state
+            entity_id: !input room_calendar
+            state: unknown
+        sequence:
+          - service: input_number.set_value
+            data:
+              value: !input background_temperature
+            target:
+              entity_id: !input required_temperature
+          - service: input_text.set_value
+            data:
+              value: >
+                {% if state_attr(local_setting_reason, 'max') < 255 %} 
+                  {{ "**Error! Setting reason helper max length must be 255**" }}
+                {% else %}
+                  {{ 'Set to background temperature, ' + local_background_temperature | round(1) | string + ', because the calendar state is unknown' }}
+                {% endif %}
+            target:
+              entity_id: !input setting_reason
+
+      #ACTION[5].CHOOSE[7]. If the calendar becomes unavailable
+      - conditions:
+          - condition: state
+            entity_id: !input room_calendar
+            state: unavailable
+        sequence:
+          - service: input_number.set_value
+            data:
+              value: !input background_temperature
+            target:
+              entity_id: !input required_temperature
+          - service: input_text.set_value
+            data:
+              value: >
+                {% if state_attr(local_setting_reason, 'max') < 255 %} 
+                  {{ "**Error! Setting reason helper max length must be 255**" }}
+                {% else %}
+                  {{ 'Set to background temperature, ' + local_background_temperature | round(1) | string + ', because the calendar is unavailable.' }}
+                {% endif %}
+            target:
+              entity_id: !input setting_reason
+
+    # ACTION[5].Default - should never happen!
+    default:
+      - service: input_number.set_value
+        data:
+          value: !input minimum_thermostat_temperature
+        target:
+          entity_id: !input required_temperature
+      - service: input_text.set_value
+        data:
+          value: >
+            {% if state_attr(local_setting_reason, 'max') < 255 %} 
+              {{ "**Error! Setting reason helper max length must be 255**" }}
+            {% else %}
+              {{ "Turned off by because room state canot be determined (program error)" }}
+            {% endif %}
+
+        target:
+          entity_id: !input setting_reason
+
+  ## -------------------------------------------------------------------------------------------------
+  ## ACTION[6] -- SEND TEMPERATURE CHANGE TO THE THERMOSTATS (BUT ONLY WHEN NECESSARY)
+  ## -------------------------------------------------------------------------------------------------
+
+  # ACTION[6].SEQUENCE[0]. Check for each thermostat in the input list whether a change to the setting is required
+  - repeat:
+      for_each: !input thermostat_controls
+      sequence:
+        - choose: 
+          #
+          # ACTION[6].SEQUENCE[0].CHOOSE[0]
+          # thermostat unknown 
+          - conditions: > 
+              {{ states(repeat.item) == 'unknown' }}
+            sequence:
+              # Create a notification
+              - service: persistent_notification.create
+                data:
+                  title: "Heating X2"
+                  message: >
+                    {{ "The thermostat '"  + repeat.item | string + "' is unknown!" }}
+                  notification_id: "{{ repeat.item }}"
+                continue_on_error: true
+                  # to prevent duplcate notifications
+              # log entry  
+              - service: script.logfile_entry
+                data: 
+                  notification_service: !input logging_service_name
+                  logfile_title: Heating X2
+                  message_preamble: "{{ log_message_preamble }}"
+                  message_body: >     
+                    {{ "Thermostat '" + repeat.item | string + "' is unknown" }}
+          #
+          # ACTION[6].SEQUENCE[0].CHOOSE[1]
+          # thermostat unavailable
+          - conditions: > 
+              {{ states(repeat.item) == 'unavailable' }}
+            sequence: 
+              # Create a notification
+              - service: persistent_notification.create
+                data:
+                  title: "Heating X2"
+                  message: >
+                    {{ "The thermostat '" + state_attr(repeat.item, 'friendly_name') | string + "' is offline" }}
+                  notification_id: >
+                    {{ repeat.item }}
+                continue_on_error: true
+                  # to prevent duplcate notifications
+              # Log entry
+              - service: script.logfile_entry
+                data: 
+                  notification_service: !input logging_service_name
+                  logfile_title: Heating X2
+                  message_preamble: "{{ log_message_preamble }}"
+                  message_body: >
+                    {{ "Thermostat '" + state_attr(repeat.item, 'friendly_name') | string + "' is unavailable" }}  
+          #
+          # ACTION[6].SEQUENCE[0].CHOOSE[2]
+          # thermostat already at the right temperaure 
+          - conditions: > 
+              {{ state_attr(repeat.item, 'temperature') | float(0) | round(1) == states(local_required_temperature) | float(5) | round(1) }}
+            sequence:
+              # dismiss any previous notifiations as the device is now apparently online  
+              - service: persistent_notification.dismiss
+                data:
+                  notification_id: "{{ repeat.item }}"
+                continue_on_error: true
+              # Log entry 
+              - service: script.logfile_entry
+                data: 
+                  notification_service: !input logging_service_name
+                  logfile_title: Heating X2
+                  message_preamble: "{{ log_message_preamble }}"
+                  message_body: >
+                    {{ "Thermostat '" + state_attr(repeat.item, 'friendly_name') | string + "' is already set to " + states(local_required_temperature) | string }} 
+          #
+          # ACTION[6].SEQUENCE[0].DEFAULT
+          # temperature needs to be changed
+          default:
+            # running in parallel bypasses failures in the climate.set_temperature branch
+            - parallel: 
+                # dismiss any previous notifications as the device is now apparently online 
+                - service: persistent_notification.dismiss
+                  data:
+                    notification_id: "{{ repeat.item }}"
+                  continue_on_error: true
+                #
+                # Send the command
+                - service: climate.set_temperature
+                  continue_on_error: true   # belt and braces 
+                  target:
+                    entity_id: "{{ repeat.item }}"
+                  data:
+                    temperature: >
+                      {{ states(local_required_temperature) }}
+                    hvac_mode: heat
+                #
+                # log the command
+                - service: script.logfile_entry
+                  data: 
+                    notification_service: !input logging_service_name
+                    logfile_title: Heating X2
+                    message_preamble: "{{ log_message_preamble }}"
+                    message_body: >
+                      {{ "Thermostat '" + state_attr(repeat.item, 'friendly_name') | string + "' set to " + states(local_required_temperature) | string }}
+                #
+                # Start the echoblock timer
+                # Only starts if there is a change. It is OK if it starts more than once (only ending triggers this automation).
+                - service: timer.start
+                  data:
+                    duration:
+                      seconds: 30
+                  target:
+                    entity_id: !input echoblock_timer
+
+  # ACTION[7] log the reason
+  - service: script.logfile_entry
+    data: 
+      notification_service: !input logging_service_name
+      logfile_title: Heating X2
+      message_preamble: "{{ log_message_preamble }}"
+      message_body: >
+        {{ "State now: " + states(local_setting_reason) | string }}
