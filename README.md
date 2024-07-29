@@ -1,15 +1,16 @@
-# Project HEATHER -- Heating XYZ Code Generator
+# Project HEATHER 
 
-Installation aid for the Home Assistant Blueprints **Heating X2**, **Calendar Switch Y2**, and **Zone Switch Z2**, 
+This project consolidates all the components of my Home Assistant heating control system: 
+- The three HA blueprints
+  - **Heating X2**
+  - **Calendar Switch Y2**
+  - **Zone Switch Z2**
+- The **Heating XYZ Code Generator** 
+- The packaged script for **Logfile Entry**
 
-Uses Microsoft Mail Merge to create YAML files for all the template sensors and helpers required for a complete home heating system. Microsoft Office (WORD and EXCEL) is a prerequisite (sorry I could not find a free package to do this).
-  
-To get started download the ZIP file to a temporary location on a local disk drive (e.g. the downloads folder) and unzip it. Problems can occur if it is used on a drive that is synchronised to a cloud service, such as iCloud or OneDrive.
+The files in this repository supercede all previous versions of these files in other locations (previously the blueprints and script were published as Gists and the Code Generator was at this location as 'Heating XYZ Code Generator' with no directory structure).  
 
-In the resulting folder there is a **Guide**, an EXCEL data file and a WORD mail merge file for each YAML file. 
-
-Please see the *Guide* inside the package for tips on setting up a full home smart heating system and details of how to use the code generator. 
-
+To get started, download and read the **Guide** PDF from the root folder, for instruction on how to set up a full home smart heating system and details of how to use the blueprints, script and code generator. 
 
 ---
 If you find the ideas in this repository useful, please [Buy Me a Coffee](https://buymeacoffee.com/andysymons)
