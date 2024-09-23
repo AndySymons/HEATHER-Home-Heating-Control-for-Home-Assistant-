@@ -14,7 +14,7 @@ The files in this repository supercede all previous versions of the files in oth
 
 The reorganisation is made solely for ease of maintenance. The current version (2.4) is compatible with all previous version 2.x intallations (not with 1.x, which is deprecated and no longer supported). 
 
-Note that these blueprints also require the packaged script [**Logfile Entry**](https://github.com/AndySymons/logfile-script/tree/main) -- now moved to its own reository becasue it is used more generally than just for heating.  
+Note that these blueprints also require the packaged script [**Logfile Entry**](https://github.com/AndySymons/logfile-script/tree/main) -- now moved to its own reository because it is used more generally than just for heating.  
 
 
 ### To get started
