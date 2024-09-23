@@ -44,6 +44,7 @@
 ###   14-Mar-2024: 2.2.12  Added further unknown and uavavailality tests on echoblock timer end (even though this is already checked when setting)  
 ###   16-Mar-2024: 2.2.13  Changed logging to use the new script.heating_xyz_logfile_entry (making the code more compact and maintainable) 
 ###   18-Jun-2024: 2.2.14  Changed the name of script heating_xyz_logfile_entry to just logfile_entry
+###   23-Sep-2024: 2.2.15  Corrected message when window is open. 
 ###
 ### OVERVIEW
 ### The main action steps are as follows.
@@ -854,7 +855,7 @@ action:
                     {% if state_attr(local_setting_reason, 'max') < 255 %} 
                       {{ "**Error! Setting reason helper max length must be 255**" }}
                     {% else %}
-                      {{ "Set to minimum temperature {{ local_minimum_thermostat_temperature | round(1) }} because a door or window is open" }}
+                      {{ "Set to minimum temperature " + local_minimum_thermostat_temperature | round(1) + " because a door or window is open" }}
                     {% endif %}
                 target:
                   entity_id: !input setting_reason
