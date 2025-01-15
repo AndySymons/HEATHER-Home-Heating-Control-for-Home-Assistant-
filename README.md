@@ -1,6 +1,6 @@
-# Project HEATHER 
+# Project HEATHER version 2
 
-This project consolidates all the components of my Home Assistant heating control system: 
+This version udates version 1 and consolidates all the components of my Home Assistant heating control system: 
 - The three HA blueprints
   - **Heating X2**
   - **Calendar Switch Y2**
